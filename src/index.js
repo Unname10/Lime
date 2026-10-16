@@ -1,3 +1,5 @@
+import { verifyKey } from 'discord-interactions';
+
 const FEEDS = [
 	'https://vnexpress.net/rss/kinh-doanh.rss',
 	'https://vnexpress.net/rss/doi-song.rss',
@@ -86,6 +88,98 @@ async function collect(env, seenKey) {
 	const uniq = new Map();
 	for (const i of all) if (!seen.has(i.link) && !uniq.has(i.link)) uniq.set(i.link, i);
 	return { seen, fresh: [...uniq.values()].slice(0, 40) };
+}
+
+const HELP_TEXT =
+	'Lệnh:\n/get - tin nóng thị trường và đời sống\n/get_analyze - phân tích bằng AI (cách nhau 5 phút)\n' +
+	'/pause [giờ] - tạm dừng tin tự động (vd 8 hoặc 2d)\n/resume - bật lại';
+
+async function execCommand(env, name, arg = '', onStart) {
+	switch (name) {
+		case 'get': {
+			const { fresh } = await collect(env, null);
+			return formatHot(fresh) || 'Chưa thấy tin nóng nào trong các nguồn lúc này.';
+		}
+		case 'get_analyze': {
+			if (await env.STATE.get('cooldown_analyze')) {
+				return 'Vừa phân tích xong, đợi vài phút rồi thử lại nhé (để tiết kiệm hạn mức Gemini).';
+			}
+			await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 60 });
+			await onStart?.(); // Telegram dùng để báo "đang phân tích"
+			const { fresh } = await collect(env, null);
+			if (!fresh.length) return 'Không lấy được tin từ các nguồn lúc này.';
+			const { text, ai } = await buildDigest(env, fresh);
+			if (ai) await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 300 });
+			return ai ? text : '⚠ Gemini đang bận, đây là tiêu đề thô:\n\n' + text;
+		}
+		case 'pause':
+			return await setPause(env, arg);
+		case 'resume':
+			if (await env.STATE.get('paused')) {
+				await env.STATE.delete('paused');
+				return '▶️ Đã bật lại tin tự động.';
+			}
+			return 'Bot đang chạy bình thường, không cần /resume.';
+		case 'help':
+			return HELP_TEXT;
+	}
+	return null;
+}
+
+async function editDiscordReply(env, token, text) {
+	const res = await timedFetch(
+		'discord reply', // nhãn ngắn để log không chứa token
+		`https://discord.com/api/v10/webhooks/${env.DISCORD_APP_ID}/${token}/messages/@original`,
+		{
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				embeds: [{ description: text.slice(0, 4000), color: 0x3e63dd }],
+				allowed_mentions: { parse: [] },
+			}),
+		},
+		10000,
+	);
+	if (!res.ok) console.error('Discord reply failed:', res.status, (await res.text()).slice(0, 200));
+}
+
+async function handleDiscord(env, ctx, req) {
+	const signature = req.headers.get('X-Signature-Ed25519');
+	const timestamp = req.headers.get('X-Signature-Timestamp');
+	const body = await req.text();
+	if (!signature || !timestamp || !(await verifyKey(body, signature, timestamp, env.DISCORD_PUBLIC_KEY))) {
+		return new Response('Bad request signature', { status: 401 });
+	}
+
+	const it = JSON.parse(body);
+	if (it.type === 1) return Response.json({ type: 1 }); // Discord kiểm tra endpoint (PING)
+	if (it.type !== 2) return new Response('ok'); // chỉ xử lý slash command
+
+	// Chỉ chủ bot được dùng lệnh
+	const uid = it.member?.user?.id || it.user?.id;
+	if (String(uid) !== String(env.DISCORD_USER_ID)) {
+		return Response.json({ type: 4, data: { content: 'Bạn không có quyền dùng lệnh này.', flags: 64 } });
+	}
+
+	const name = it.data.name.replace(/-/g, '_');
+	const arg = it.data.options?.[0]?.value != null ? String(it.data.options[0].value) : '';
+
+	ctx.waitUntil(
+		(async () => {
+			let out;
+			try {
+				out = await execCommand(env, name, arg);
+			} catch (e) {
+				console.error('DISCORD CMD FAILED:', e?.stack || e);
+				out = 'Có lỗi khi xử lý lệnh, thử lại sau nhé.';
+			}
+			await editDiscordReply(env, it.token, out || 'Lệnh không hợp lệ.');
+		})(),
+	);
+
+	// Trả lời tạm trong 3 giây: "đang xử lý". Tin get/get_analyze hiện công khai, còn lại chỉ mình bạn thấy
+	const isPublic = ['get', 'get_analyze'].includes(name);
+	return Response.json({ type: 5, data: { flags: isPublic ? 0 : 64 } });
 }
 
 async function sendDiscord(env, text, silent = false) {
@@ -450,50 +544,20 @@ async function setPause(env, arg) {
 	return `⏸ Tạm dừng ${m[1]} ${isDay ? 'ngày' : 'giờ'}, sau đó tự bật lại. Gõ /resume để bật sớm.`;
 }
 
+const TG_CMDS = { '/get': 'get', '/get_analyze': 'get_analyze', '/pause': 'pause', '/resume': 'resume', '/help': 'help', '/start': 'help' };
+
 async function handleUpdate(env, update) {
 	const msg = update.message;
 	if (!msg?.text) return;
 	if (String(msg.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) return; // bỏ qua người lạ
 
-	const cmd = msg.text.trim().split(/[\s@]/)[0].toLowerCase(); // xử lý cả dạng /get@TenBot
+	const cmd = msg.text.trim().split(/[\s@]/)[0].toLowerCase();
 	const arg = msg.text.trim().split(/\s+/).slice(1).join(' ');
+	const name = TG_CMDS[cmd];
+	if (!name) return;
 
-	if (cmd === '/get') {
-		const { fresh } = await collect(env, null);
-		await sendTelegram(env, formatHot(fresh) || 'Chưa thấy tin nóng nào trong các nguồn lúc này.');
-	} else if (cmd === '/get_analyze') {
-		if (await env.STATE.get('cooldown_analyze')) {
-			await sendTelegram(env, 'Vừa phân tích xong, đợi vài phút rồi thử lại nhé (để tiết kiệm hạn mức Gemini).', true);
-			return;
-		}
-		await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 60 });
-		await sendTelegram(env, '⏳ Đang phân tích, chờ khoảng nửa phút...', true);
-
-		const { fresh } = await collect(env, null);
-		if (!fresh.length) {
-			await sendTelegram(env, 'Không lấy được tin từ các nguồn lúc này.');
-			return;
-		}
-		const { text, ai } = await buildDigest(env, fresh);
-		if (ai) await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 300 });
-		await sendTelegram(env, ai ? text : '⚠ Gemini đang bận, đây là tiêu đề thô:\n\n' + text);
-	} else if (cmd === '/help' || cmd === '/start') {
-		await sendTelegram(
-			env,
-			'Lệnh:\n/get - tin nóng thị trường và đời sống\n/get_analyze - phân tích bằng AI (cách nhau 5 phút)\n' +
-				'/pause [giờ] - tạm dừng tin tự động (vd /pause 8, /pause 2d)\n/resume - bật lại',
-			true,
-		);
-	} else if (cmd === '/pause') {
-		await sendTelegram(env, await setPause(env, arg), true);
-	} else if (cmd === '/resume') {
-		if (await env.STATE.get('paused')) {
-			await env.STATE.delete('paused');
-			await sendTelegram(env, '▶️ Đã bật lại tin tự động.', true);
-		} else {
-			await sendTelegram(env, 'Bot đang chạy bình thường, không cần /resume.', true);
-		}
-	}
+	const out = await execCommand(env, name, arg, () => sendTelegram(env, '⏳ Đang phân tích, chờ khoảng nửa phút...', true));
+	if (out) await sendTelegram(env, out, !['get', 'get_analyze'].includes(name));
 }
 
 export default {
@@ -507,6 +571,7 @@ export default {
 	},
 	async fetch(req, env, ctx) {
 		const url = new URL(req.url);
+		if (req.method === 'POST' && url.pathname === '/discord') return handleDiscord(env, ctx, req);
 		if (req.method === 'POST' && url.pathname === '/telegram') {
 			if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
 				return new Response('forbidden', { status: 403 });
