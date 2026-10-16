@@ -137,7 +137,66 @@ async function cleanup(env) {
 	if (keep.length !== sent.length) await env.STATE.put('sent', JSON.stringify(keep));
 }
 
-async function analyze(env, fresh) {
+async function discoverModels(env) {
+	const res = await timedFetch(
+		'list models',
+		'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200',
+		{ headers: { 'x-goog-api-key': env.GEMINI_API_KEY } },
+		15000,
+	);
+	if (!res.ok) throw new Error('list models ' + res.status);
+	const { models = [] } = await res.json();
+
+	const TIER = { flash: 2, 'flash-lite': 1 };
+	const SKIP = /tts|image|live|audio|embed|computer|robotics|vision|thinking|exp|dialog|learnlm/;
+
+	const ranked = models
+		.filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+		.map((m) => {
+			const name = m.name.replace(/^models\//, '');
+			const p = /^gemini-(\d+)(?:\.(\d+))?-(flash-lite|flash)(?:-(.+))?$/.exec(name);
+			if (!p) return null;
+			const suffix = p[4] || '';
+			if (/^\d{3}$/.test(suffix) || SKIP.test(suffix)) return null;
+			if (suffix && env.GEMINI_ALLOW_PREVIEW !== '1') return null;
+			return { name, ver: +p[1] * 100 + +(p[2] || 0), tier: TIER[p[3]], suffix };
+		})
+		.filter(Boolean)
+		.sort((a, b) => b.tier - a.tier || b.ver - a.ver || a.suffix.length - b.suffix.length);
+
+	const flash = ranked.filter((r) => r.tier === 2).slice(0, 3);
+	const lite = ranked.filter((r) => r.tier === 1).slice(0, 2);
+	return [...flash, ...lite].map((r) => r.name);
+}
+
+async function getModelChain(env) {
+	let chain = await env.STATE.get('model_chain', 'json');
+	if (!chain?.length) {
+		try {
+			chain = await discoverModels(env);
+			if (chain.length) await env.STATE.put('model_chain', JSON.stringify(chain), { expirationTtl: 86400 });
+		} catch (e) {
+			console.error('discover models failed:', e.message);
+			chain = [];
+		}
+	}
+	// Model cấu hình tay đặt ở cuối làm lưới an toàn khi việc khám phá lỗi
+	const manual = [env.GEMINI_MODEL, env.GEMINI_FALLBACK_MODEL].filter(Boolean);
+	return [...new Set([...chain, ...manual])];
+}
+
+async function loadBad(env) {
+	const bad = (await env.STATE.get('bad_models', 'json')) || {};
+	for (const k of Object.keys(bad)) if (bad[k] < Date.now()) delete bad[k];
+	return bad;
+}
+
+async function markBad(env, bad, model, ms) {
+	bad[model] = Date.now() + ms;
+	await env.STATE.put('bad_models', JSON.stringify(bad), { expirationTtl: 86400 });
+}
+
+async function analyze(env, fresh, budgetMs = 25_000) {
 	const list = fresh.map((i, n) => `[${n + 1}] ${i.title}`).join('\n');
 	const prompt =
 		'Bạn là trợ lý phân tích tin chứng khoán Việt Nam. Chỉ dựa vào danh sách tiêu đề đánh số bên dưới, ' +
@@ -158,9 +217,19 @@ async function analyze(env, fresh) {
 
 	console.log('prompt length:', prompt.length); // phải dài hàng trăm ký tự, không phải 3
 
-	const models = [env.GEMINI_MODEL, env.GEMINI_FALLBACK_MODEL].filter(Boolean);
-	for (const model of models) {
-		for (let attempt = 1; attempt <= 3; attempt++) {
+	const chain = await getModelChain(env);
+	const bad = await loadBad(env);
+	console.log('model chain:', chain.join(', '));
+	const deadline = Date.now() + budgetMs;
+
+	for (const model of chain) {
+		if (bad[model] > Date.now()) continue;
+		for (let attempt = 1; attempt <= 2; attempt++) {
+			const left = deadline - Date.now();
+			if (left < 4000) {
+				console.error('Hết ngân sách thời gian, dừng thử model');
+				return null;
+			}
 			try {
 				const res = await timedFetch(
 					`gemini ${model} #${attempt}`,
@@ -170,32 +239,43 @@ async function analyze(env, fresh) {
 						headers: { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' },
 						body: JSON.stringify({
 							contents: [{ parts: [{ text: prompt }] }],
-							generationConfig: { temperature: 0.3, maxOutputTokens: 3000 },
+							generationConfig: { temperature: 0.3, maxOutputTokens: 1500 },
 						}),
 					},
-					30000,
+					Math.min(left, 10000),
 				);
 				if (res.ok) {
 					const data = await res.json();
 					const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-					// Bỏ qua câu trả lời ngắn hoặc lạc đề (không có số nguồn [n])
-					if (text && text.length > 150) return text;
-					console.error('Gemini trả lời bất thường:', (text || '').slice(0, 100));
+					if (text && text.length > 150 && /\[\d+\]/.test(text)) {
+						console.log('Gemini dùng model:', model);
+						return text;
+					}
+					console.error('Gemini trả lời bất thường:', model, (text || '').slice(0, 100));
 					break;
 				}
-				console.error('Gemini failed:', res.status, await res.text());
-				if (![429, 500, 503].includes(res.status)) break;
+				const body = await res.text();
+				console.error('Gemini failed:', model, res.status, body.slice(0, 300));
+				if ([500, 503].includes(res.status)) {
+					await markBad(env, bad, model, 3 * 60_000);
+					break;
+				}
+				const noFreeQuota = res.status === 429 && /limit:\s*0\b/.test(body);
+				const ttl = noFreeQuota || [403, 404].includes(res.status) ? 24 * 3600_000 : res.status === 429 ? 15 * 60_000 : 0;
+				if (ttl) await markBad(env, bad, model, ttl);
+				break;
 			} catch (e) {
-				console.error('Gemini error:', e.name);
+				console.error('Gemini error:', model, e.name);
+				if (e.name === 'TimeoutError') await markBad(env, bad, model, 10 * 60_000); // model chậm, tạm bỏ qua
+				break;
 			}
-			await sleep(attempt * 3000);
 		}
 	}
 	return null;
 }
 
-async function buildDigest(env, items) {
-	const summary = await analyze(env, items);
+async function buildDigest(env, items, budgetMs) {
+	const summary = await analyze(env, items, budgetMs);
 	const body =
 		summary ||
 		items
@@ -246,7 +326,7 @@ async function run(env) {
 	console.log('fresh =', fresh.length);
 	if (!fresh.length) return;
 
-	const { text } = await buildDigest(env, fresh);
+	const { text } = await buildDigest(env, fresh, 60000);
 
 	if (await sendTelegram(env, text)) {
 		fresh.forEach((i) => seen.add(i.link));
@@ -269,7 +349,7 @@ async function handleUpdate(env, update) {
 			await sendTelegram(env, 'Vừa phân tích xong, đợi vài phút rồi thử lại nhé (để tiết kiệm hạn mức Gemini).', true);
 			return;
 		}
-		await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 300 });
+		await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 60 });
 		await sendTelegram(env, '⏳ Đang phân tích, chờ khoảng nửa phút...', true);
 
 		const { fresh } = await collect(env, null);
@@ -278,6 +358,7 @@ async function handleUpdate(env, update) {
 			return;
 		}
 		const { text, ai } = await buildDigest(env, fresh);
+		if (ai) await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 300 });
 		await sendTelegram(env, ai ? text : '⚠ Gemini đang bận, đây là tiêu đề thô:\n\n' + text);
 	} else if (cmd === '/help' || cmd === '/start') {
 		await sendTelegram(env, 'Lệnh:\n/get - tin nóng thị trường và đời sống\n/get_analyze - phân tích bằng AI (cách nhau 5 phút)', true);
@@ -287,7 +368,11 @@ async function handleUpdate(env, update) {
 export default {
 	async scheduled(event, env, ctx) {
 		const job = event.cron === CLEAN_CRON ? cleanup : event.cron === HOT_CRON ? runHot : run;
-		ctx.waitUntil(job(env).catch((e) => console.error('RUN FAILED:', e?.stack || e)));
+		try {
+			await job(env);
+		} catch (e) {
+			console.error('RUN FAILED:', e?.stack || e);
+		}
 	},
 	async fetch(req, env, ctx) {
 		const url = new URL(req.url);
@@ -296,10 +381,18 @@ export default {
 				return new Response('forbidden', { status: 403 });
 			}
 			const update = await req.json().catch(() => null);
-			if (update) {
-				ctx.waitUntil(handleUpdate(env, update).catch((e) => console.error('UPDATE FAILED:', e?.stack || e)));
+			if (!update) return new Response('ok');
+
+			const key = 'upd:' + update.update_id;
+			if (await env.STATE.get(key)) return new Response('ok'); // Telegram gửi lại, bỏ qua
+			await env.STATE.put(key, '1', { expirationTtl: 300 });
+
+			try {
+				await handleUpdate(env, update);
+			} catch (e) {
+				console.error('UPDATE FAILED:', e?.stack || e);
 			}
-			return new Response('ok'); // trả lời ngay để Telegram không gửi lại
+			return new Response('ok');
 		}
 		return new Response('not found', { status: 404 });
 	},

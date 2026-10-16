@@ -22,8 +22,5 @@
 			"head_sampling_rate": 1,
 			"persist": true,
 		},
-		"issue_detection": {
-			"enabled": false,
-		},
 	},
 }

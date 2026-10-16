@@ -6,7 +6,7 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev --test-scheduled",
 		"start": "wrangler dev --test-scheduled",
-		"clear": "wrangler kv key delete seen_hot --binding STATE && wrangler kv key delete seen --binding STATE"
+		"clear": "wrangler kv key delete seen_hot --binding STATE && wrangler kv key delete seen --binding STATE && wrangler kv key delete model_chain --binding STATE && wrangler kv key delete bad_models --binding STATE"
 	},
 	"devDependencies": {
 		"wrangler": "^4.151.0"
