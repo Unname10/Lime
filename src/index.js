@@ -308,6 +308,10 @@ function formatHot(items) {
 }
 
 async function runHot(env) {
+	if (await env.STATE.get('paused')) {
+		console.log('paused, bỏ qua');
+		return;
+	}
 	const { seen, fresh } = await collect(env, 'seen_hot');
 	console.log('hot mode, fresh =', fresh.length);
 	if (!fresh.length) return;
@@ -322,6 +326,10 @@ async function runHot(env) {
 }
 
 async function run(env) {
+	if (await env.STATE.get('paused')) {
+		console.log('paused, bỏ qua');
+		return;
+	}
 	const { seen, fresh } = await collect(env, 'seen');
 	console.log('fresh =', fresh.length);
 	if (!fresh.length) return;
@@ -334,12 +342,32 @@ async function run(env) {
 	}
 }
 
+async function setPause(env, arg) {
+	const text = arg.trim();
+	if (!text) {
+		await env.STATE.put('paused', 'forever');
+		return '⏸ Đã tạm dừng tin tự động. Gõ /resume để bật lại.';
+	}
+	const m = /^(\d+)\s*(h|d)?$/i.exec(text);
+	if (!m || +m[1] === 0) {
+		return 'Cú pháp: /pause (đến khi /resume), /pause 8 (8 giờ), /pause 2d (2 ngày).';
+	}
+	const isDay = m[2]?.toLowerCase() === 'd';
+	const ms = +m[1] * (isDay ? 86400_000 : 3600_000);
+	// KV tự xóa khóa khi hết hạn, nên bot tự bật lại mà không cần cron
+	await env.STATE.put('paused', String(Date.now() + ms), {
+		expirationTtl: Math.max(60, Math.round(ms / 1000)),
+	});
+	return `⏸ Tạm dừng ${m[1]} ${isDay ? 'ngày' : 'giờ'}, sau đó tự bật lại. Gõ /resume để bật sớm.`;
+}
+
 async function handleUpdate(env, update) {
 	const msg = update.message;
 	if (!msg?.text) return;
 	if (String(msg.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) return; // bỏ qua người lạ
 
 	const cmd = msg.text.trim().split(/[\s@]/)[0].toLowerCase(); // xử lý cả dạng /get@TenBot
+	const arg = msg.text.trim().split(/\s+/).slice(1).join(' ');
 
 	if (cmd === '/get') {
 		const { fresh } = await collect(env, null);
@@ -361,7 +389,21 @@ async function handleUpdate(env, update) {
 		if (ai) await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 300 });
 		await sendTelegram(env, ai ? text : '⚠ Gemini đang bận, đây là tiêu đề thô:\n\n' + text);
 	} else if (cmd === '/help' || cmd === '/start') {
-		await sendTelegram(env, 'Lệnh:\n/get - tin nóng thị trường và đời sống\n/get_analyze - phân tích bằng AI (cách nhau 5 phút)', true);
+		await sendTelegram(
+			env,
+			'Lệnh:\n/get - tin nóng thị trường và đời sống\n/get_analyze - phân tích bằng AI (cách nhau 5 phút)\n' +
+				'/pause [giờ] - tạm dừng tin tự động (vd /pause 8, /pause 2d)\n/resume - bật lại',
+			true,
+		);
+	} else if (cmd === '/pause') {
+		await sendTelegram(env, await setPause(env, arg), true);
+	} else if (cmd === '/resume') {
+		if (await env.STATE.get('paused')) {
+			await env.STATE.delete('paused');
+			await sendTelegram(env, '▶️ Đã bật lại tin tự động.', true);
+		} else {
+			await sendTelegram(env, 'Bot đang chạy bình thường, không cần /resume.', true);
+		}
 	}
 }
 
