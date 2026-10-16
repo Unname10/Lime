@@ -89,6 +89,28 @@ async function collect(env, seenKey) {
 	return { seen, fresh: [...uniq.values()].slice(0, 40) };
 }
 
+async function sendDiscord(env, text, silent = false) {
+	if (!env.DISCORD_WEBHOOK_URL) return false; // chưa cấu hình thì bỏ qua
+	const uid = env.DISCORD_USER_ID;
+	const res = await timedFetch('discord', env.DISCORD_WEBHOOK_URL, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			username: 'Lime',
+			// Ping riêng bạn để chắc chắn có thông báo đẩy, kể cả khi server chỉ báo khi bị @
+			content: uid && !silent ? `<@${uid}>` : undefined,
+			embeds: [{ description: text.slice(0, 4000), color: 0x3e63dd }],
+			// Chỉ cho phép ping đúng bạn, không bao giờ ping @everyone/@here
+			allowed_mentions: uid ? { users: [uid] } : { parse: [] },
+			...(silent ? { flags: 4096 } : {}), // 4096 = gửi im lặng, không thông báo
+		}),
+	}).catch(() => null);
+
+	if (!res) return false;
+	if (!res.ok) console.error('Discord failed:', res.status, (await res.text()).slice(0, 200));
+	return res.ok;
+}
+
 async function sendTelegram(env, text, silent = false, track = false) {
 	const tg = await timedFetch('telegram', `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
 		method: 'POST',
@@ -114,6 +136,12 @@ async function sendTelegram(env, text, silent = false, track = false) {
 		}
 	}
 	return true;
+}
+
+// Gửi cả hai nơi; thành công khi ít nhất một nơi nhận được
+async function notify(env, text, silent = false, track = false) {
+	const [tg, dc] = await Promise.all([sendTelegram(env, text, silent, track), sendDiscord(env, text, silent)]);
+	return tg || dc;
 }
 
 const DAY = 24 * 3600 * 1000;
@@ -239,14 +267,26 @@ async function analyze(env, fresh, budgetMs = 25_000) {
 						headers: { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' },
 						body: JSON.stringify({
 							contents: [{ parts: [{ text: prompt }] }],
-							generationConfig: { temperature: 0.3, maxOutputTokens: 1500 },
+							generationConfig: { temperature: 0.3, maxOutputTokens: 4000 },
 						}),
 					},
 					Math.min(left, 10000),
 				);
 				if (res.ok) {
 					const data = await res.json();
-					const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+					const cand = data.candidates?.[0];
+					let text = (cand?.content?.parts || [])
+						.filter((p) => !p.thought)
+						.map((p) => p.text || '')
+						.join('')
+						.trim();
+					console.log('finish:', cand?.finishReason, 'usage:', JSON.stringify(data.usageMetadata), 'head:', text.slice(0, 120));
+
+					// Bị cắt do hết token: bỏ đoạn dở dang ở cuối, báo rõ là rút gọn
+					if (cand?.finishReason === 'MAX_TOKENS') {
+						const cut = text.lastIndexOf('\n');
+						text = (cut > 0 ? text.slice(0, cut) : text) + '\n…(bản tin bị rút gọn)';
+					}
 					if (text && text.length > 150 && /\[\d+\]/.test(text)) {
 						console.log('Gemini dùng model:', model);
 						return text;
@@ -274,15 +314,20 @@ async function analyze(env, fresh, budgetMs = 25_000) {
 	return null;
 }
 
+const plain = (t) =>
+	t
+		.replace(/\*\*/g, '')
+		.replace(/^\s*[*-]\s+/gm, '• ')
+		.replace(/^#+\s*/gm, '');
+
 async function buildDigest(env, items, budgetMs) {
 	const summary = await analyze(env, items, budgetMs);
-	const body =
-		summary ||
-		items
-			.slice(0, 8)
-			.map((i, n) => `• ${i.title} [${n + 1}]`)
-			.join('\n');
-
+	const body = summary
+		? plain(summary)
+		: items
+				.slice(0, 8)
+				.map((i, n) => `• ${i.title} [${n + 1}]`)
+				.join('\n');
 	const cited = [...new Set([...body.matchAll(/\[(\d+)\]/g)].map((m) => +m[1]))].filter((n) => n >= 1 && n <= items.length).slice(0, 8);
 	const idx = cited.length ? cited : [1, 2, 3, 4, 5].filter((n) => n <= items.length);
 
@@ -318,7 +363,7 @@ async function runHot(env) {
 
 	const text = formatHot(fresh);
 	let ok = true;
-	if (text) ok = await sendTelegram(env, text); // nếu bạn đã làm phần tự xóa tin, giữ "false, true"
+	if (text) ok = await notify(env, text); // nếu bạn đã làm phần tự xóa tin, giữ "false, true"
 	if (ok) {
 		fresh.forEach((i) => seen.add(i.link));
 		await env.STATE.put('seen_hot', JSON.stringify([...seen].slice(-300)));
@@ -336,7 +381,7 @@ async function run(env) {
 
 	const { text } = await buildDigest(env, fresh, 60000);
 
-	if (await sendTelegram(env, text)) {
+	if (await notify(env, text)) {
 		fresh.forEach((i) => seen.add(i.link));
 		await env.STATE.put('seen', JSON.stringify([...seen].slice(-300)));
 	}
