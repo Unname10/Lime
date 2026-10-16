@@ -1,13 +1,14 @@
 {
-  "name": "lime",
-  "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev --test-scheduled",
-    "start": "wrangler dev --test-scheduled"
-  },
-  "devDependencies": {
-    "wrangler": "^4.151.0"
-  }
+	"name": "lime",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev --test-scheduled",
+		"start": "wrangler dev --test-scheduled",
+		"clear": "wrangler kv key delete seen_hot --binding STATE && wrangler kv key delete seen --binding STATE"
+	},
+	"devDependencies": {
+		"wrangler": "^4.151.0"
+	}
 }

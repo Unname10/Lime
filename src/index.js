@@ -1,5 +1,6 @@
 const FEEDS = [
 	'https://vnexpress.net/rss/kinh-doanh.rss',
+	'https://vnexpress.net/rss/doi-song.rss',
 	'https://vietstock.vn/144/chung-khoan.rss',
 	'https://vietstock.vn/579/nhan-dinh-phan-tich.rss',
 	'https://cafef.vn/thi-truong-chung-khoan.rss',
@@ -61,14 +62,92 @@ function parseItems(xml, limit = 10) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const BLUECHIPS = 'VCB, BID, CTG, TCB, VPB, MBB, ACB, HPG, FPT, VNM, VIC, VHM, MWG, GAS, MSN, SSI, GVR, SAB, PLX';
+const LIFE =
+	/giá xăng|xăng dầu|giá vàng|vàng miếng|tỷ giá|giá điện|lãi suất (tiết kiệm|vay|huy động)|lạm phát|CPI|giá heo|giá thịt|giá gạo|giá cà phê|giá nhà|giá đất|bất động sản|lương tối thiểu|bảo hiểm|thuế/i;
+
+const isMarket = (t) => KEYWORDS.test(t) || TICKERS.test(t);
+const isLife = (t) => LIFE.test(t.normalize('NFC'));
+const HOT_CRON = '0 2-8 * * 1-5';
+
+// Từ khóa tin nóng, bạn tự tinh chỉnh theo thực tế
+const KEYWORDS =
+	/VN-?Index|HNX-?Index|tăng trần|giảm sàn|bán ròng|mua ròng|khối ngoại|margin|tỷ giá|NHNN|UBCK|đình chỉ|hạn chế giao dịch|xử phạt|cổ tức|chào bán|thoái vốn|room ngoại|ETF/i;
+const TICKERS = new RegExp(`\\b(${BLUECHIPS.split(', ').join('|')})\\b`); // phân biệt hoa thường
+
+async function collect(env, seenKey) {
+	const seen = new Set(seenKey ? JSON.parse((await env.STATE.get(seenKey)) || '[]') : []);
+	const results = await Promise.allSettled(
+		FEEDS.map((u) =>
+			timedFetch('feed ' + new URL(u).host + new URL(u).pathname, u, {
+				headers: { 'User-Agent': 'Mozilla/5.0 (compatible; stock-news-bot)' },
+			}).then((r) => r.text()),
+		),
+	);
+	const all = results.filter((r) => r.status === 'fulfilled').flatMap((r) => parseItems(r.value));
+	const uniq = new Map();
+	for (const i of all) if (!seen.has(i.link) && !uniq.has(i.link)) uniq.set(i.link, i);
+	return { seen, fresh: [...uniq.values()].slice(0, 40) };
+}
+
+async function sendTelegram(env, text, silent = false, track = false) {
+	const tg = await timedFetch('telegram', `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			chat_id: env.TELEGRAM_CHAT_ID,
+			text: text.slice(0, 4000),
+			disable_web_page_preview: true,
+			disable_notification: silent,
+		}),
+	});
+	if (!tg.ok) {
+		console.error('Telegram failed:', tg.status, await tg.text());
+		return false;
+	}
+	if (track) {
+		const data = await tg.json().catch(() => null);
+		const id = data?.result?.message_id;
+		if (id) {
+			const sent = JSON.parse((await env.STATE.get('sent')) || '[]');
+			sent.push({ id, t: Date.now() });
+			await env.STATE.put('sent', JSON.stringify(sent.slice(-100)));
+		}
+	}
+	return true;
+}
+
+const DAY = 24 * 3600 * 1000;
+const CLEAN_CRON = '0 14 * * *'; // 21:00 giờ VN, mỗi ngày kể cả cuối tuần
+
+async function cleanup(env) {
+	const sent = JSON.parse((await env.STATE.get('sent')) || '[]');
+	const keep = [];
+	for (const m of sent) {
+		if (Date.now() - m.t < DAY) {
+			keep.push(m);
+			continue;
+		}
+		// Xóa thất bại (đã xóa tay, quá 48 giờ) thì vẫn bỏ khỏi danh sách, không thử lại mãi
+		await timedFetch('telegram delete', `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/deleteMessage`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, message_id: m.id }),
+		}).catch(() => {});
+	}
+	if (keep.length !== sent.length) await env.STATE.put('sent', JSON.stringify(keep));
+}
 
 async function analyze(env, fresh) {
 	const list = fresh.map((i, n) => `[${n + 1}] ${i.title}`).join('\n');
 	const prompt =
 		'Bạn là trợ lý phân tích tin chứng khoán Việt Nam. Chỉ dựa vào danh sách tiêu đề đánh số bên dưới, ' +
 		'viết bản tin bằng tiếng Việt, văn bản thuần (không markdown, không in đậm) theo cấu trúc:\n' +
-		'1) TỔNG QUAN: 2-3 câu về tâm lý thị trường hôm nay.\n' +
-		'2) CỔ PHIẾU VỐN HÓA LỚN: chọn tối đa 4 mã vốn hóa lớn được nhắc trong tin ' +
+		'1) TIN NÓNG: 4-5 tin thị trường đáng chú ý nhất (biến động, khối ngoại, chính sách, doanh nghiệp lớn), ' +
+		'rồi 2-3 tin đời sống ảnh hưởng tới túi tiền (xăng dầu, vàng, tỷ giá, lãi suất, giá cả, bất động sản). ' +
+		"Mỗi tin một dòng bắt đầu bằng '•', tin đời sống thêm '🏠' ở đầu dòng, cuối dòng ghi số nguồn [n]. " +
+		'Bỏ qua tin giải trí, du lịch, chuyện cá nhân người nổi tiếng.\n' +
+		'2) TỔNG QUAN: 2-3 câu về tâm lý thị trường hôm nay.\n' +
+		'3) CỔ PHIẾU VỐN HÓA LỚN: chọn tối đa 4 mã vốn hóa lớn được nhắc trong tin ' +
 		`(ưu tiên: ${BLUECHIPS}). Mỗi mã viết 2-3 dòng: tín hiệu từ tin tức (tích cực/trung lập/tiêu cực), ` +
 		'yếu tố có thể hỗ trợ phục hồi, rủi ro, điều cần theo dõi. Cuối mỗi nhận định ghi số nguồn dạng [n].\n' +
 		'Quy tắc: nếu tin không đủ để đánh giá một mã thì bỏ qua mã đó; tuyệt đối không bịa số liệu ' +
@@ -91,7 +170,7 @@ async function analyze(env, fresh) {
 						headers: { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' },
 						body: JSON.stringify({
 							contents: [{ parts: [{ text: prompt }] }],
-							generationConfig: { temperature: 0.3, maxOutputTokens: 1500 },
+							generationConfig: { temperature: 0.3, maxOutputTokens: 3000 },
 						}),
 					},
 					30000,
@@ -115,81 +194,113 @@ async function analyze(env, fresh) {
 	return null;
 }
 
-async function run(env) {
-	console.log('token set:', !!env.TELEGRAM_TOKEN, 'len:', env.TELEGRAM_TOKEN?.length, 'chat set:', !!env.TELEGRAM_CHAT_ID);
-
-	const seen = new Set(JSON.parse((await env.STATE.get('seen')) || '[]'));
-	console.log('KV ok, seen =', seen.size);
-
-	const results = await Promise.allSettled(
-		FEEDS.map((u) =>
-			timedFetch('feed ' + new URL(u).host + new URL(u).pathname, u, {
-				headers: { 'User-Agent': 'Mozilla/5.0 (compatible; stock-news-bot)' },
-			}).then((r) => r.text()),
-		),
-	);
-	console.log(
-		'feeds:',
-		results.map((r) => r.status),
-	);
-	const all = results.filter((r) => r.status === 'fulfilled').flatMap((r) => parseItems(r.value));
-
-	const uniq = new Map();
-	for (const i of all) {
-		if (!seen.has(i.link) && !uniq.has(i.link)) uniq.set(i.link, i);
-	}
-	const fresh = [...uniq.values()].slice(0, 40); // giới hạn tổng để prompt gọn
-	console.log('fresh =', fresh.length);
-
-	if (!fresh.length) return;
-
-	const summary = await analyze(env, fresh);
-
-	// Dự phòng khi LLM lỗi: tiêu đề thô, cũng đánh số để dùng chung cơ chế nguồn
+async function buildDigest(env, items) {
+	const summary = await analyze(env, items);
 	const body =
 		summary ||
-		fresh
+		items
 			.slice(0, 8)
 			.map((i, n) => `• ${i.title} [${n + 1}]`)
 			.join('\n');
 
-	// Gom các số nguồn được nhắc, giữ thứ tự xuất hiện, tối đa 8
-	const cited = [...new Set([...body.matchAll(/\[(\d+)\]/g)].map((m) => +m[1]))].filter((n) => n >= 1 && n <= fresh.length).slice(0, 8);
-	const idx = cited.length ? cited : [1, 2, 3, 4, 5].filter((n) => n <= fresh.length);
+	const cited = [...new Set([...body.matchAll(/\[(\d+)\]/g)].map((m) => +m[1]))].filter((n) => n >= 1 && n <= items.length).slice(0, 8);
+	const idx = cited.length ? cited : [1, 2, 3, 4, 5].filter((n) => n <= items.length);
 
 	const footer =
 		'\n\n⚠ Nhận định dựa trên tin tức, chỉ mang tính tham khảo, không phải khuyến nghị đầu tư.' +
 		'\n\nNguồn:\n' +
-		idx.map((n) => `[${n}] ${fresh[n - 1].link}`).join('\n');
+		idx.map((n) => `[${n}] ${items[n - 1].link}`).join('\n');
 
-	const text = getVietnameseDateTime().date + body.slice(0, 4000 - footer.length) + footer;
+	const head = getVietnameseDateTime().date;
+	return { text: head + body.slice(0, 4000 - head.length - footer.length) + footer, ai: !!summary };
+}
 
-	const tg = await timedFetch('telegram', `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			chat_id: env.TELEGRAM_CHAT_ID,
-			text, // dùng trực tiếp, không cắt hay cộng gì thêm
-			disable_web_page_preview: true,
-		}),
-	});
+function formatHot(items) {
+	const market = items.filter((i) => isMarket(i.title)).slice(0, 6);
+	const life = items.filter((i) => !isMarket(i.title) && isLife(i.title)).slice(0, 4);
+	if (!market.length && !life.length) return null;
+	const hhmm = getVietnameseDateTime().time.trim().slice(0, 5);
+	const fmt = (i) => `• ${i.title}\n${i.link}`;
+	const parts = [`🔥 TIN NÓNG ${hhmm}`];
+	if (market.length) parts.push('📈 Thị trường\n' + market.map(fmt).join('\n'));
+	if (life.length) parts.push('🏠 Đời sống\n' + life.map(fmt).join('\n'));
+	return parts.join('\n\n');
+}
 
-	// Chỉ đánh dấu "đã gửi" khi Telegram nhận thành công
-	if (tg.ok) {
+async function runHot(env) {
+	const { seen, fresh } = await collect(env, 'seen_hot');
+	console.log('hot mode, fresh =', fresh.length);
+	if (!fresh.length) return;
+
+	const text = formatHot(fresh);
+	let ok = true;
+	if (text) ok = await sendTelegram(env, text); // nếu bạn đã làm phần tự xóa tin, giữ "false, true"
+	if (ok) {
+		fresh.forEach((i) => seen.add(i.link));
+		await env.STATE.put('seen_hot', JSON.stringify([...seen].slice(-300)));
+	}
+}
+
+async function run(env) {
+	const { seen, fresh } = await collect(env, 'seen');
+	console.log('fresh =', fresh.length);
+	if (!fresh.length) return;
+
+	const { text } = await buildDigest(env, fresh);
+
+	if (await sendTelegram(env, text)) {
 		fresh.forEach((i) => seen.add(i.link));
 		await env.STATE.put('seen', JSON.stringify([...seen].slice(-300)));
-	} else {
-		console.error('Telegram failed:', tg.status, await tg.text());
+	}
+}
+
+async function handleUpdate(env, update) {
+	const msg = update.message;
+	if (!msg?.text) return;
+	if (String(msg.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) return; // bỏ qua người lạ
+
+	const cmd = msg.text.trim().split(/[\s@]/)[0].toLowerCase(); // xử lý cả dạng /get@TenBot
+
+	if (cmd === '/get') {
+		const { fresh } = await collect(env, null);
+		await sendTelegram(env, formatHot(fresh) || 'Chưa thấy tin nóng nào trong các nguồn lúc này.');
+	} else if (cmd === '/get_analyze') {
+		if (await env.STATE.get('cooldown_analyze')) {
+			await sendTelegram(env, 'Vừa phân tích xong, đợi vài phút rồi thử lại nhé (để tiết kiệm hạn mức Gemini).', true);
+			return;
+		}
+		await env.STATE.put('cooldown_analyze', '1', { expirationTtl: 300 });
+		await sendTelegram(env, '⏳ Đang phân tích, chờ khoảng nửa phút...', true);
+
+		const { fresh } = await collect(env, null);
+		if (!fresh.length) {
+			await sendTelegram(env, 'Không lấy được tin từ các nguồn lúc này.');
+			return;
+		}
+		const { text, ai } = await buildDigest(env, fresh);
+		await sendTelegram(env, ai ? text : '⚠ Gemini đang bận, đây là tiêu đề thô:\n\n' + text);
+	} else if (cmd === '/help' || cmd === '/start') {
+		await sendTelegram(env, 'Lệnh:\n/get - tin nóng thị trường và đời sống\n/get_analyze - phân tích bằng AI (cách nhau 5 phút)', true);
 	}
 }
 
 export default {
 	async scheduled(event, env, ctx) {
-		ctx.waitUntil(run(env).catch((e) => console.error('RUN FAILED:', e?.stack || e)));
+		const job = event.cron === CLEAN_CRON ? cleanup : event.cron === HOT_CRON ? runHot : run;
+		ctx.waitUntil(job(env).catch((e) => console.error('RUN FAILED:', e?.stack || e)));
 	},
-	// Chỉ để test, xóa sau khi xong
 	async fetch(req, env, ctx) {
-		ctx.waitUntil(run(env).catch((e) => console.error('RUN FAILED:', e?.stack || e)));
-		return new Response('ok');
+		const url = new URL(req.url);
+		if (req.method === 'POST' && url.pathname === '/telegram') {
+			if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
+				return new Response('forbidden', { status: 403 });
+			}
+			const update = await req.json().catch(() => null);
+			if (update) {
+				ctx.waitUntil(handleUpdate(env, update).catch((e) => console.error('UPDATE FAILED:', e?.stack || e)));
+			}
+			return new Response('ok'); // trả lời ngay để Telegram không gửi lại
+		}
+		return new Response('not found', { status: 404 });
 	},
 };
