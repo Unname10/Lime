@@ -60,14 +60,13 @@ function parseItems(xml, limit = 10) {
 	return items;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const BLUECHIPS = 'VCB, BID, CTG, TCB, VPB, MBB, ACB, HPG, FPT, VNM, VIC, VHM, MWG, GAS, MSN, SSI, GVR, SAB, PLX';
 const LIFE =
 	/giá xăng|xăng dầu|giá vàng|vàng miếng|tỷ giá|giá điện|lãi suất (tiết kiệm|vay|huy động)|lạm phát|CPI|giá heo|giá thịt|giá gạo|giá cà phê|giá nhà|giá đất|bất động sản|lương tối thiểu|bảo hiểm|thuế/i;
 
 const isMarket = (t) => KEYWORDS.test(t) || TICKERS.test(t);
 const isLife = (t) => LIFE.test(t.normalize('NFC'));
-const HOT_CRON = '0 2-8 * * 1-5';
+const HOT_CRON = '0 2-8 * * MON-FRI';
 
 // Từ khóa tin nóng, bạn tự tinh chỉnh theo thực tế
 const KEYWORDS =
@@ -112,16 +111,29 @@ async function sendDiscord(env, text, silent = false) {
 }
 
 async function sendTelegram(env, text, silent = false, track = false) {
-	const tg = await timedFetch('telegram', `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			chat_id: env.TELEGRAM_CHAT_ID,
-			text: text.slice(0, 4000),
-			disable_web_page_preview: true,
-			disable_notification: silent,
-		}),
-	});
+	let tg;
+	for (let attempt = 1; attempt <= 2 && !tg; attempt++) {
+		try {
+			tg = await timedFetch(
+				'telegram',
+				`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						chat_id: env.TELEGRAM_CHAT_ID,
+						text: text.slice(0, 4000),
+						disable_web_page_preview: true,
+						disable_notification: silent,
+					}),
+				},
+				10000,
+			);
+		} catch (e) {
+			// timeout hoặc lỗi mạng: vòng lặp sẽ thử lại một lần
+		}
+	}
+	if (!tg) return false;
 	if (!tg.ok) {
 		console.error('Telegram failed:', tg.status, await tg.text());
 		return false;
@@ -138,9 +150,17 @@ async function sendTelegram(env, text, silent = false, track = false) {
 	return true;
 }
 
-// Gửi cả hai nơi; thành công khi ít nhất một nơi nhận được
 async function notify(env, text, silent = false, track = false) {
-	const [tg, dc] = await Promise.all([sendTelegram(env, text, silent, track), sendDiscord(env, text, silent)]);
+	const safe = (p, name) =>
+		p.catch((e) => {
+			console.error(`${name} notify error:`, e?.name, e?.message);
+			return false;
+		});
+	const [tg, dc] = await Promise.all([
+		safe(sendTelegram(env, text, silent, track), 'telegram'),
+		safe(sendDiscord(env, text, silent), 'discord'),
+	]);
+	if (tg !== dc) console.error(`Gửi lệch: telegram=${tg} discord=${dc}`);
 	return tg || dc;
 }
 
@@ -224,7 +244,18 @@ async function markBad(env, bad, model, ms) {
 	await env.STATE.put('bad_models', JSON.stringify(bad), { expirationTtl: 86400 });
 }
 
-async function analyze(env, fresh, budgetMs = 25_000) {
+const PROFILES = {
+	fast: { budgetMs: 25_000, perTryMs: 9_000, maxTokens: 3000 }, // /get_analyze: webhook bị giới hạn 30 giây
+	deep: { budgetMs: 70_000, perTryMs: 40_000, maxTokens: 8000 }, // bản tin sáng: không ai chờ
+};
+
+function thinkingFor(model, mode) {
+	if (/^gemini-3/.test(model)) return { thinkingLevel: mode === 'deep' ? 'high' : 'low' };
+	if (/^gemini-2\.5/.test(model)) return { thinkingBudget: mode === 'deep' ? 4096 : 0 };
+	return undefined; // dòng khác: để mặc định
+}
+
+async function analyze(env, fresh, mode = 'fast') {
 	const list = fresh.map((i, n) => `[${n + 1}] ${i.title}`).join('\n');
 	const prompt =
 		'Bạn là trợ lý phân tích tin chứng khoán Việt Nam. Chỉ dựa vào danh sách tiêu đề đánh số bên dưới, ' +
@@ -245,33 +276,39 @@ async function analyze(env, fresh, budgetMs = 25_000) {
 
 	console.log('prompt length:', prompt.length); // phải dài hàng trăm ký tự, không phải 3
 
+	const P = PROFILES[mode];
 	const chain = await getModelChain(env);
 	const bad = await loadBad(env);
-	console.log('model chain:', chain.join(', '));
-	const deadline = Date.now() + budgetMs;
+	const deadline = Date.now() + P.budgetMs;
+	console.log(`analyze[${mode}] chain:`, chain.join(', '));
 
 	for (const model of chain) {
-		if (bad[model] > Date.now()) continue;
+		const key = `${mode}:${model}`; // model chậm ở chế độ deep không bị cấm ở chế độ fast
+		if (bad[key] > Date.now()) continue;
+		let useThinking = true;
+
 		for (let attempt = 1; attempt <= 2; attempt++) {
 			const left = deadline - Date.now();
 			if (left < 4000) {
-				console.error('Hết ngân sách thời gian, dừng thử model');
+				console.error('Hết ngân sách thời gian');
 				return null;
 			}
+			const generationConfig = { temperature: 0.3, maxOutputTokens: P.maxTokens };
+			const thinking = useThinking ? thinkingFor(model, mode) : undefined;
+			if (thinking) generationConfig.thinkingConfig = thinking;
+
 			try {
 				const res = await timedFetch(
-					`gemini ${model} #${attempt}`,
+					`gemini ${model} ${mode} #${attempt}`,
 					`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
 					{
 						method: 'POST',
 						headers: { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' },
-						body: JSON.stringify({
-							contents: [{ parts: [{ text: prompt }] }],
-							generationConfig: { temperature: 0.3, maxOutputTokens: 4000 },
-						}),
+						body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig }),
 					},
-					Math.min(left, 10000),
+					Math.min(left, P.perTryMs),
 				);
+
 				if (res.ok) {
 					const data = await res.json();
 					const cand = data.candidates?.[0];
@@ -280,33 +317,40 @@ async function analyze(env, fresh, budgetMs = 25_000) {
 						.map((p) => p.text || '')
 						.join('')
 						.trim();
-					console.log('finish:', cand?.finishReason, 'usage:', JSON.stringify(data.usageMetadata), 'head:', text.slice(0, 120));
+					console.log('finish:', cand?.finishReason, 'usage:', JSON.stringify(data.usageMetadata));
 
-					// Bị cắt do hết token: bỏ đoạn dở dang ở cuối, báo rõ là rút gọn
 					if (cand?.finishReason === 'MAX_TOKENS') {
 						const cut = text.lastIndexOf('\n');
 						text = (cut > 0 ? text.slice(0, cut) : text) + '\n…(bản tin bị rút gọn)';
 					}
-					if (text && text.length > 150 && /\[\d+\]/.test(text)) {
+					if (text.length > 150 && /\[\d+\]/.test(text)) {
 						console.log('Gemini dùng model:', model);
 						return text;
 					}
-					console.error('Gemini trả lời bất thường:', model, (text || '').slice(0, 100));
+					console.error('Gemini trả lời bất thường:', model, text.slice(0, 100));
 					break;
 				}
+
 				const body = await res.text();
 				console.error('Gemini failed:', model, res.status, body.slice(0, 300));
+
+				// Tham số thinking không hợp lệ với model này: thử lại không kèm thinking
+				if (res.status === 400 && useThinking && /think/i.test(body)) {
+					useThinking = false;
+					continue;
+				}
+				// Quá tải: bỏ qua ít phút và sang model kế ngay
 				if ([500, 503].includes(res.status)) {
-					await markBad(env, bad, model, 3 * 60_000);
+					await markBad(env, bad, key, 3 * 60_000);
 					break;
 				}
 				const noFreeQuota = res.status === 429 && /limit:\s*0\b/.test(body);
 				const ttl = noFreeQuota || [403, 404].includes(res.status) ? 24 * 3600_000 : res.status === 429 ? 15 * 60_000 : 0;
-				if (ttl) await markBad(env, bad, model, ttl);
+				if (ttl) await markBad(env, bad, key, ttl);
 				break;
 			} catch (e) {
 				console.error('Gemini error:', model, e.name);
-				if (e.name === 'TimeoutError') await markBad(env, bad, model, 10 * 60_000); // model chậm, tạm bỏ qua
+				if (e.name === 'TimeoutError') await markBad(env, bad, key, 10 * 60_000);
 				break;
 			}
 		}
@@ -320,8 +364,8 @@ const plain = (t) =>
 		.replace(/^\s*[*-]\s+/gm, '• ')
 		.replace(/^#+\s*/gm, '');
 
-async function buildDigest(env, items, budgetMs) {
-	const summary = await analyze(env, items, budgetMs);
+async function buildDigest(env, items, mode = 'fast') {
+	const summary = await analyze(env, items, mode);
 	const body = summary
 		? plain(summary)
 		: items
@@ -379,7 +423,7 @@ async function run(env) {
 	console.log('fresh =', fresh.length);
 	if (!fresh.length) return;
 
-	const { text } = await buildDigest(env, fresh, 60000);
+	const { text } = await buildDigest(env, fresh, 'deep');
 
 	if (await notify(env, text)) {
 		fresh.forEach((i) => seen.add(i.link));

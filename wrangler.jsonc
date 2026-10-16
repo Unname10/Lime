@@ -3,7 +3,11 @@
 	"main": "src/index.js",
 	"compatibility_date": "2026-10-01",
 	"triggers": {
-		"crons": ["0 1 * * 1-5", "0 2-8 * * 1-5", "0 14 * * *"],
+		"crons": [
+			"0 1 * * MON-FRI",      // 08:00 giờ VN: bản tin tổng hợp
+			"0 2-8 * * MON-FRI",    // 09:00-15:00 giờ VN, mỗi giờ: tin nóng
+			"0 14 * * *"            // 21:00 giờ VN, mỗi ngày: dọn tin (nếu có làm)
+		]
 	},
 	"kv_namespaces": [{ "binding": "STATE", "id": "3c05237c9185476da7b32c4ebdb3f185" }],
 	"vars": {
